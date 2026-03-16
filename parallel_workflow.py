@@ -22,6 +22,15 @@ Config.set_llm_config({
 })
 
 
+def _extract_mas_text(result: Any) -> str:
+    """兼容不同 OxyGent 版本的返回字段。"""
+    if hasattr(result, "output") and isinstance(result.output, str):
+        return result.output
+    if hasattr(result, "answer") and isinstance(result.answer, str):
+        return result.answer
+    return str(result)
+
+
 # ============================================
 # 使用ParallelAgent的oxy_space定义
 # ============================================
@@ -191,7 +200,7 @@ Use crawl_wikipedia_pages with:
 
 Return the complete results with all page contents."""
         
-        crawl_result = await mas.ainvoke(query=crawl_query)
+        crawl_result = await mas.chat_with_agent(payload={"query": crawl_query})
         print(f"✅ Crawl complete")
         
         # Step 2: 准备批量分析请求
@@ -264,7 +273,7 @@ Task:
 Call clustering_agent with the analyzed data to produce final categorized index.
 Then save to output/batch_auto_clustered.json"""
         
-        cluster_result = await mas.ainvoke(query=cluster_query)
+        cluster_result = await mas.chat_with_agent(payload={"query": cluster_query})
         print(f"✅ Clustering complete!")
         
         # 保存结果
@@ -276,7 +285,7 @@ Then save to output/batch_auto_clustered.json"""
                 {"page": pages_to_analyze[i]["title"], "trace_id": r[0], "result": r[1][:500]}
                 for i, r in enumerate(batch_results)
             ],
-            "clustering_result": cluster_result.answer if hasattr(cluster_result, 'answer') else "N/A"
+            "clustering_result": _extract_mas_text(cluster_result)
         }
         
         with open("output/batch_auto_clustered.json", "w", encoding="utf-8") as f:
@@ -341,10 +350,11 @@ Execute now!"""
         print("-" * 70)
         
         try:
-            result = await mas.ainvoke(query=query)
+            result = await mas.chat_with_agent(payload={"query": query})
             print("\n✅ Workflow complete!")
-            if hasattr(result, 'answer'):
-                print(f"\n📋 Result summary:\n{result.answer[:800]}...")
+            result_text = _extract_mas_text(result)
+            if result_text:
+                print(f"\n📋 Result summary:\n{result_text[:800]}...")
         except Exception as e:
             print(f"\n❌ Error: {str(e)}")
             import traceback

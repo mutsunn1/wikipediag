@@ -192,6 +192,15 @@ def create_crawl_request(
 请开始执行！"""
 
 
+def _extract_mas_text(result: Any) -> str:
+    """兼容不同 OxyGent 版本的返回字段。"""
+    if hasattr(result, "output") and isinstance(result.output, str):
+        return result.output
+    if hasattr(result, "answer") and isinstance(result.answer, str):
+        return result.answer
+    return str(result)
+
+
 # ============================================
 # 主程序
 # ============================================
@@ -266,7 +275,7 @@ async def main(output_dir: str = "output", language: str = "zh"):
             async with MAS(oxy_space=oxy_space) as mas:
                 # 执行爬取任务
                 start_time = datetime.now()
-                result = await mas.ainvoke(query=query)
+                result = await mas.chat_with_agent(payload={"query": query})
                 elapsed = (datetime.now() - start_time).total_seconds()
                 
                 print(f"\n✅ 爬取完成: {domain}")
@@ -277,8 +286,9 @@ async def main(output_dir: str = "output", language: str = "zh"):
                 print(f"   • JSON数据: {config.output_dir}/{domain.replace(' ', '_')}_data.json")
                 
                 # 打印结果摘要
-                if hasattr(result, 'answer'):
-                    summary = result.answer[:1000] if len(result.answer) > 1000 else result.answer
+                summary_text = _extract_mas_text(result)
+                if summary_text:
+                    summary = summary_text[:1000] if len(summary_text) > 1000 else summary_text
                     print(f"\n📋 结果摘要:\n{summary}")
                 
         except Exception as e:
@@ -372,7 +382,7 @@ Output should be in Chinese (简体中文)."""
         
         try:
             start_time = datetime.now()
-            result = await mas.ainvoke(query=query)
+            result = await mas.chat_with_agent(payload={"query": query})
             elapsed = (datetime.now() - start_time).total_seconds()
             
             print(f"\n✅ 爬取完成！耗时: {elapsed:.1f}秒")
@@ -381,8 +391,9 @@ Output should be in Chinese (简体中文)."""
             print(f"   • Markdown索引: {config.output_dir}/index/Computer Science_index.md")
             print(f"   • JSON数据: {config.output_dir}/Computer Science_data.json")
             
-            if hasattr(result, 'answer'):
-                print(f"\n📋 结果:\n{result.answer}")
+            result_text = _extract_mas_text(result)
+            if result_text:
+                print(f"\n📋 结果:\n{result_text}")
         except Exception as e:
             print(f"\n❌ 错误: {str(e)}")
             import traceback
@@ -434,7 +445,7 @@ async def custom_crawl(
     try:
         async with MAS(oxy_space=oxy_space) as mas:
             start_time = datetime.now()
-            result = await mas.ainvoke(query=query)
+            result = await mas.chat_with_agent(payload={"query": query})
             elapsed = (datetime.now() - start_time).total_seconds()
             
             print(f"\n✅ 爬取完成！耗时: {elapsed:.1f}秒")
@@ -442,8 +453,9 @@ async def custom_crawl(
             print(f"   • 分类文件夹: {config.output_dir}/content/{domain.replace(' ', '_')}/")
             print(f"   • Markdown索引: {config.output_dir}/index/{domain.replace(' ', '_')}_index.md")
             
-            if hasattr(result, 'answer'):
-                print(f"\n📋 结果摘要:\n{result.answer[:800]}")
+            result_text = _extract_mas_text(result)
+            if result_text:
+                print(f"\n📋 结果摘要:\n{result_text[:800]}")
                 
     except Exception as e:
         print(f"\n❌ 错误: {str(e)}")
@@ -504,6 +516,21 @@ if __name__ == "__main__":
         default="zh",
         help="输出语言: zh=简体中文, en=英文 (默认: zh)"
     )
+
+    # 兼容旧用法: --custom "Physics" 30 zh
+    parser.add_argument(
+        "legacy_pages",
+        nargs="?",
+        type=int,
+        help=argparse.SUPPRESS
+    )
+
+    parser.add_argument(
+        "legacy_lang",
+        nargs="?",
+        choices=["zh", "en"],
+        help=argparse.SUPPRESS
+    )
     
     args = parser.parse_args()
     
@@ -513,10 +540,13 @@ if __name__ == "__main__":
         asyncio.run(quick_demo(output_dir=args.output))
     elif args.custom:
         # 自定义爬取模式
+        pages = args.legacy_pages if args.legacy_pages is not None else args.pages
+        language = args.legacy_lang if args.legacy_lang is not None else args.lang
+
         asyncio.run(custom_crawl(
             domain=args.custom,
-            max_pages=args.pages,
-            language=args.lang,
+            max_pages=pages,
+            language=language,
             output_dir=args.output
         ))
     else:

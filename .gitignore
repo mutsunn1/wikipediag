@@ -41,6 +41,7 @@ env/
 output/
 cache/
 *.log
+cache_dir
 
 # OS
 .DS_Store

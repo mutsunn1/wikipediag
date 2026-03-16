@@ -229,7 +229,10 @@ def save_page_to_category(
     title: str = Field(description="Page title"),
     content: str = Field(description="Page content to save"),
     url: str = Field(description="Original URL"),
-    metadata: Dict[str, Any] = Field(description="Additional metadata (summary, key_concepts, etc.)", default={})
+    metadata: Dict[str, Any] = Field(
+        description="Additional metadata (summary, key_concepts, etc.)",
+        default_factory=dict
+    ),
     file_format: str = Field(description="File format: 'md' or 'txt'", default="md")
     ) -> str:
     """

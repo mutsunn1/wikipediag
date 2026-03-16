@@ -208,29 +208,6 @@ config = CrawlerConfig(
 }
 ```
 
-## 🏗️ 系统架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Master Agent                           │
-└──────────────────┬──────────────────────────────────────────┘
-                   │
-    ┌──────────────┼──────────────┐
-    │              │              │
-    ▼              ▼              ▼
-┌────────┐   ┌──────────┐   ┌─────────────────┐
-│  Plan  │   │ Parallel │   │  Clustering     │
-│ Agent  │   │ Analyzer │   │    Agent        │
-└────────┘   └──────────┘   └─────────────────┘
-                                   │
-                                   ▼
-                    ┌──────────────────────────┐
-                    │   save_categorized_content │
-                    │   - 创建分类文件夹          │
-                    │   - 保存Markdown文件        │
-                    │   - 生成索引文件            │
-                    └──────────────────────────┘
-```
 
 ## 🤖 Agent说明
 
@@ -323,59 +300,6 @@ TRANSLATIONS = {
 }
 ```
 
-## 🛠️ 自定义开发
-
-### 添加新的语言支持
-
-1. 在 `config.py` 的 `TRANSLATIONS` 中添加新语言：
-
-```python
-TRANSLATIONS = {
-    "zh": { ... },
-    "en": { ... },
-    "ja": {  # 日语
-        "title": "タイトル",
-        "summary": "概要",
-        # ...
-    }
-}
-```
-
-2. 使用时指定语言代码：
-
-```python
-{"domain": "Computer Science", "max_pages": 30, "language": "ja"}
-```
-
-### 修改输出格式
-
-编辑 `tools.py` 中的以下函数：
-
-- `save_page_to_category`: 修改页面保存格式
-- `generate_markdown_index`: 修改索引文件格式
-
-### 调整分类逻辑
-
-编辑 `prompts.py` 中的 `CLUSTERING_AGENT_PROMPT`：
-
-```python
-# 调整分类数量
-"分类数量应合理（通常5-10个主要分类）"
-
-# 或修改分类标准
-"分类应基于主题相似度，而非技术难度"
-```
-
-## ⚠️ 注意事项
-
-1. **API成本**: 分析50个页面约需50+次LLM调用
-2. **存储空间**: 每个页面约保存5-20KB的Markdown文件
-3. **文件夹权限**: 确保有写入 `output/` 目录的权限
-4. **爬取频率**: 内置0.3s延迟避免请求过快
-5. **编码问题**: 默认使用UTF-8编码
-
-## 📊 工作流程
-
 ```
 1. Plan Agent制定爬取计划
          ↓
@@ -393,12 +317,6 @@ TRANSLATIONS = {
    output/index/{domain}_index.md
 ```
 
-## 📝 技术栈
-
-- [Oxygent](https://github.com/jd-opensource/OxyGent) - Multi-Agent框架
-- [aiohttp](https://docs.aiohttp.org/) - 异步HTTP
-- Wikipedia API - 页面数据
-- OpenAI/Compatible API - LLM推理
 
 ## License
 
