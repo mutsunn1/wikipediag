@@ -18,6 +18,7 @@ wikipediagent
 import asyncio
 import json
 import os
+import re
 from typing import List, Dict, Any
 from datetime import datetime
 
@@ -210,6 +211,39 @@ def _is_timeout_response(text: str) -> bool:
         or "was cancelled" in lower
         or "tool default_llm timed out" in lower
     )
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    """Try to extract a JSON object from raw LLM text responses."""
+    if not text:
+        return {}
+
+    candidate = text.strip()
+
+    # Remove markdown code fence if present.
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\\s*```$", "", candidate)
+
+    # Fast path: exact JSON object.
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+
+    # Fallback: first {...} block.
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        snippet = candidate[start:end + 1]
+        try:
+            parsed = json.loads(snippet)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    return {}
 
 
 async def _run_query_with_retry(mas: MAS, query: str, retries: int = 1) -> tuple[Any, float, bool]:
@@ -445,7 +479,9 @@ async def custom_crawl(
     domain: str, 
     max_pages: int, 
     language: str = "zh",
-    output_dir: str = "output"
+    output_dir: str = "output",
+    hard_parallel: bool = False,
+    parallel_workers: int = 10,
 ):
     """
     自定义爬取函数
@@ -471,6 +507,10 @@ async def custom_crawl(
     print("=" * 70)
     print(f"   目标页面数: {max_pages}")
     print(f"   输出语言: {'简体中文' if language == 'zh' else 'English'}")
+    if hard_parallel:
+        print(f"   分析模式: 代码硬并发 ({parallel_workers}并发/批次)")
+    else:
+        print("   分析模式: Agent 自主调度 (可能串行)")
     
     # 确保输出目录存在
     os.makedirs(config.content_dir, exist_ok=True)
@@ -478,25 +518,191 @@ async def custom_crawl(
     
     # 创建请求
     query = create_crawl_request(domain, max_pages, language)
-    
+
     try:
         async with MAS(oxy_space=oxy_space) as mas:
-            result, elapsed, timed_out = await _run_query_with_retry(mas, query, retries=1)
-            result_text = _extract_mas_text(result)
+            if not hard_parallel:
+                result, elapsed, timed_out = await _run_query_with_retry(mas, query, retries=1)
+                result_text = _extract_mas_text(result)
 
-            if timed_out:
-                print(f"\n❌ 爬取失败！耗时: {elapsed:.1f}秒")
-                print("   原因: LLM 调用超时（已重试）")
-                print(f"\n📋 错误摘要:\n{result_text[:800]}")
+                if timed_out:
+                    print(f"\n❌ 爬取失败！耗时: {elapsed:.1f}秒")
+                    print("   原因: LLM 调用超时（已重试）")
+                    print(f"\n📋 错误摘要:\n{result_text[:800]}")
+                    return
+
+                print(f"\n✅ 爬取完成！耗时: {elapsed:.1f}秒")
+                print(f"\n📁 输出文件：")
+                print(f"   • 分类文件夹: {config.output_dir}/content/{domain.replace(' ', '_')}/")
+                print(f"   • Markdown索引: {config.output_dir}/index/{domain.replace(' ', '_')}_index.md")
+
+                print(f"\n📋 结果摘要:\n{result_text[:800]}")
                 return
 
+            # ===== Hard parallel path: deterministic 10-way (or configured) batch analysis =====
+            started_at = datetime.now()
+
+            print("\n🧠 Step 1/4: 生成搜索计划...")
+            plan_query = f'''Create a Wikipedia crawl plan in JSON only.
+Input:
+- domain: "{domain}"
+- max_pages: {max_pages}
+- language: "{language}"
+
+Required JSON fields:
+- search_queries: string[]
+- search_strategy: string
+- estimated_pages: number
+- expected_subtopics: string[]
+
+Return JSON only.'''
+            plan_result = await mas.chat_with_agent(payload={"query": plan_query})
+            plan_data = _extract_json_object(_extract_mas_text(plan_result))
+            search_queries = plan_data.get("search_queries", []) if isinstance(plan_data, dict) else []
+            if not isinstance(search_queries, list):
+                search_queries = []
+            search_queries = [str(q).strip() for q in search_queries if str(q).strip()]
+            if not search_queries:
+                search_queries = [f"{domain} overview", domain]
+
+            print(f"   计划关键词数: {len(search_queries)}")
+
+            print("\n📥 Step 2/4: 爬取页面...")
+            crawl_text = await tools.crawl_wikipedia_pages(
+                queries=search_queries,
+                max_pages=max_pages,
+                pages_per_query=max(2, min(5, parallel_workers // 2)),
+            )
+            crawl_data = _extract_json_object(crawl_text)
+            pages = crawl_data.get("pages", []) if isinstance(crawl_data, dict) else []
+            if not isinstance(pages, list):
+                pages = []
+            if not pages:
+                print("\n❌ 爬取失败：未获取到任何页面")
+                return
+
+            print(f"   实际爬取页面数: {len(pages)}")
+
+            print(f"\n⚡ Step 3/4: 并行分析页面（每批 {parallel_workers} 并发）...")
+            analyzed_pages: List[Dict[str, Any]] = []
+
+            # Ensure valid worker count.
+            workers = max(1, int(parallel_workers))
+
+            for start in range(0, len(pages), workers):
+                batch = pages[start:start + workers]
+                analysis_requests = []
+                for page in batch:
+                    title = str(page.get("title", ""))
+                    content = str(page.get("content", ""))[:3000]
+                    req = f'''Analyze this page and return JSON only.
+Input:
+- page_title: "{title}"
+- page_content: """{content}"""
+- target_domain: "{domain}"
+- language: "{language}"
+
+Required JSON fields:
+- is_relevant
+- relevance_score
+- analysis_summary
+- main_topics
+- key_concepts
+- technical_level
+- suggested_category_tags
+- related_areas'''
+                    analysis_requests.append(req)
+
+                print(f"   批次 {start // workers + 1}: 提交 {len(analysis_requests)} 个并发分析请求")
+                batch_results = await mas.start_batch_processing(
+                    analysis_requests,
+                    return_trace_id=True,
+                )
+
+                for idx, (_, answer) in enumerate(batch_results):
+                    page = batch[idx] if idx < len(batch) else {}
+                    analysis = _extract_json_object(str(answer))
+                    analyzed_pages.append({
+                        "title": page.get("title", "Untitled"),
+                        "url": page.get("url", ""),
+                        "content": page.get("content", ""),
+                        "analysis": analysis,
+                    })
+
+            print(f"   分析完成页面数: {len(analyzed_pages)}")
+
+            print("\n🗂️ Step 4/4: 自动聚类并保存...")
+            clustering_input = []
+            for item in analyzed_pages:
+                analysis = item.get("analysis", {}) if isinstance(item.get("analysis"), dict) else {}
+                clustering_input.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("content", ""),
+                    "main_topics": analysis.get("main_topics", []),
+                    "key_concepts": analysis.get("key_concepts", []),
+                    "suggested_category_tags": analysis.get("suggested_category_tags", []),
+                    "analysis_summary": analysis.get("analysis_summary", ""),
+                    "relevance_score": analysis.get("relevance_score", 0),
+                })
+
+            clustering_query = f'''Cluster analyzed Wikipedia pages and return JSON only.
+Input:
+- target_domain: "{domain}"
+- total_pages: {len(clustering_input)}
+- language: "{language}"
+- analyzed_pages: {json.dumps(clustering_input, ensure_ascii=False)[:12000]}
+
+Output JSON fields:
+- domain
+- total_pages
+- auto_generated_categories
+- category_relations
+- uncategorized_pages
+- index_summary'''
+
+            cluster_result = await mas.chat_with_agent(payload={"query": clustering_query})
+            categorized_data = _extract_json_object(_extract_mas_text(cluster_result))
+            if not categorized_data:
+                categorized_data = {
+                    "domain": domain,
+                    "total_pages": len(clustering_input),
+                    "auto_generated_categories": [
+                        {
+                            "category_name": "Uncategorized",
+                            "description": "Fallback category generated by system.",
+                            "page_count": len(clustering_input),
+                            "pages": [
+                                {
+                                    "title": p.get("title", "Untitled"),
+                                    "url": p.get("url", ""),
+                                    "content": p.get("content", ""),
+                                    "summary": p.get("analysis_summary", ""),
+                                    "key_concepts": p.get("key_concepts", []),
+                                    "relevance_score": p.get("relevance_score", 0),
+                                }
+                                for p in clustering_input
+                            ],
+                        }
+                    ],
+                    "category_relations": [],
+                    "uncategorized_pages": [],
+                    "index_summary": "Generated by fallback path due to non-JSON cluster response.",
+                }
+
+            save_result = tools.save_categorized_content(
+                domain=domain,
+                categorized_data=categorized_data,
+                language=language,
+            )
+
+            elapsed = (datetime.now() - started_at).total_seconds()
             print(f"\n✅ 爬取完成！耗时: {elapsed:.1f}秒")
             print(f"\n📁 输出文件：")
             print(f"   • 分类文件夹: {config.output_dir}/content/{domain.replace(' ', '_')}/")
             print(f"   • Markdown索引: {config.output_dir}/index/{domain.replace(' ', '_')}_index.md")
+            print(f"\n📋 保存结果:\n{save_result[:800]}")
 
-            print(f"\n📋 结果摘要:\n{result_text[:800]}")
-                
     except Exception as e:
         print(f"\n❌ 错误: {str(e)}")
         import traceback
@@ -557,6 +763,19 @@ if __name__ == "__main__":
         help="输出语言: zh=简体中文, en=英文 (默认: zh)"
     )
 
+    parser.add_argument(
+        "--hard-parallel",
+        action="store_true",
+        help="在 --custom 模式启用代码层并发分析（避免Agent串行调度）"
+    )
+
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=10,
+        help="--hard-parallel 模式每批并发分析数 (默认: 10)"
+    )
+
     # 兼容旧用法: --custom "Physics" 30 zh
     parser.add_argument(
         "legacy_pages",
@@ -587,7 +806,9 @@ if __name__ == "__main__":
             domain=args.custom,
             max_pages=pages,
             language=language,
-            output_dir=args.output
+            output_dir=args.output,
+            hard_parallel=args.hard_parallel,
+            parallel_workers=args.parallel_workers,
         ))
     else:
         # 标准模式
