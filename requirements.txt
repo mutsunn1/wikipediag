@@ -1,0 +1,5 @@
+oxygent
+aiohttp
+beautifulsoup4
+wikipedia-api
+python-dotenv
