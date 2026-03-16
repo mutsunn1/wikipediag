@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import random
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote, urlparse
@@ -33,9 +34,32 @@ class WikipediaCrawler:
     
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self.max_retries = 3
+        self.base_delay = 0.5
+        self.proxy: Optional[str] = self._resolve_proxy()
+
+    @staticmethod
+    def _resolve_proxy() -> Optional[str]:
+        """从配置和环境变量解析可选代理地址。"""
+        config_proxy = (get_config().https_proxy or "").strip()
+        env_proxy = (
+            os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+            or ""
+        ).strip()
+
+        proxy = config_proxy or env_proxy
+        if not proxy:
+            return None
+
+        # aiohttp 代理需要带协议头。
+        if proxy.startswith("http://") or proxy.startswith("https://"):
+            return proxy
+        return f"http://{proxy}"
         
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=25, connect=10),
             headers={
                 "User-Agent": "OxygentWikiCrawler/1.0 (Educational Purpose)"
             }
@@ -64,20 +88,31 @@ class WikipediaCrawler:
             "utf8": 1
         }
         
-        try:
-            async with self.session.get(self.SEARCH_API, params=params, timeout=30) as resp:
-                data = await resp.json()
-                results = []
-                for item in data.get("query", {}).get("search", []):
-                    results.append({
-                        "title": item["title"],
-                        "pageid": str(item["pageid"]),
-                        "snippet": item.get("snippet", ""),
-                        "url": f"{self.BASE_URL}/wiki/{quote(item['title'].replace(' ', '_'))}"
-                    })
-                return results
-        except Exception as e:
-            return [{"error": str(e)}]
+        for attempt in range(self.max_retries):
+            try:
+                async with self.session.get(
+                    self.SEARCH_API,
+                    params=params,
+                    proxy=self.proxy,
+                ) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+
+                    data = await resp.json(content_type=None)
+                    results = []
+                    for item in data.get("query", {}).get("search", []):
+                        results.append({
+                            "title": item["title"],
+                            "pageid": str(item["pageid"]),
+                            "snippet": item.get("snippet", ""),
+                            "url": f"{self.BASE_URL}/wiki/{quote(item['title'].replace(' ', '_'))}"
+                        })
+                    return results
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    return [{"error": f"search failed: {str(e)}"}]
+                backoff = self.base_delay * (2 ** attempt) + random.uniform(0, 0.2)
+                await asyncio.sleep(backoff)
     
     async def get_page_content(self, title: str) -> Dict[str, Any]:
         """获取页面完整内容"""
@@ -88,34 +123,47 @@ class WikipediaCrawler:
             "action": "query",
             "prop": "extracts|info",
             "titles": title,
-            "explaintext": True,
+            "explaintext": 1,
             "exlimit": 1,
             "exchars": 8000,
             "format": "json",
             "utf8": 1
         }
         
-        try:
-            async with self.session.get(self.SEARCH_API, params=params, timeout=30) as resp:
-                data = await resp.json()
-                pages = data.get("query", {}).get("pages", {})
-                
-                for page_id, page_data in pages.items():
-                    if "missing" in page_data:
-                        return {"error": "Page not found"}
-                    
-                    content = page_data.get("extract", "")
-                    return {
-                        "title": page_data.get("title", title),
-                        "pageid": page_id,
-                        "content": content,
-                        "url": f"{self.BASE_URL}/wiki/{quote(title.replace(' ', '_'))}",
-                        "word_count": len(content.split()),
-                        "char_count": len(content)
-                    }
-                return {"error": "No content found"}
-        except Exception as e:
-            return {"error": str(e)}
+        for attempt in range(self.max_retries):
+            try:
+                async with self.session.get(
+                    self.SEARCH_API,
+                    params=params,
+                    proxy=self.proxy,
+                ) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+
+                    data = await resp.json(content_type=None)
+                    pages = data.get("query", {}).get("pages", {})
+
+                    for page_id, page_data in pages.items():
+                        if "missing" in page_data:
+                            return {"error": "Page not found"}
+
+                        content = page_data.get("extract", "")
+                        page_title = page_data.get("title", title)
+                        return {
+                            "title": page_title,
+                            "pageid": page_id,
+                            "content": content,
+                            "url": f"{self.BASE_URL}/wiki/{quote(page_title.replace(' ', '_'))}",
+                            "word_count": len(content.split()),
+                            "char_count": len(content)
+                        }
+
+                    return {"error": "No content found"}
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    return {"error": f"get_page_content failed: {str(e)}"}
+                backoff = self.base_delay * (2 ** attempt) + random.uniform(0, 0.2)
+                await asyncio.sleep(backoff)
 
 
 # ============================================
@@ -156,48 +204,61 @@ async def crawl_wikipedia_pages(
     pages_per_query: int = Field(description="Maximum pages per query", default=5)
 ) -> str:
     """批量爬取Wikipedia页面"""
-    all_pages = []
-    pages_collected = 0
+    all_pages: List[Dict[str, Any]] = []
     seen_titles = set()
-    
+
     async with WikipediaCrawler() as crawler:
+        # 先收集候选标题，再并发抓取，显著缩短整体耗时。
+        candidate_titles: List[str] = []
         for query in queries:
-            if pages_collected >= max_pages:
+            if len(candidate_titles) >= max_pages * 2:
                 break
-                
-            remaining = max_pages - pages_collected
-            limit = min(pages_per_query, remaining)
-            
+
+            remaining = max_pages - len(candidate_titles)
+            limit = min(pages_per_query, max(1, remaining))
+
             print(f"Searching: '{query}' (limit: {limit})")
             search_results = await crawler.search_pages(query, limit)
-            
+
             for result in search_results:
-                if pages_collected >= max_pages:
-                    break
-                    
                 if "error" in result:
                     continue
-                
+
                 title = result["title"]
                 if title in seen_titles:
                     continue
-                
+
+                seen_titles.add(title)
+                candidate_titles.append(title)
+                if len(candidate_titles) >= max_pages:
+                    break
+
+            if len(candidate_titles) >= max_pages:
+                break
+
+        semaphore = asyncio.Semaphore(6)
+
+        async def fetch_one(title: str) -> Dict[str, Any]:
+            async with semaphore:
                 print(f"  Fetching: {title}")
-                page_content = await crawler.get_page_content(title)
-                
-                if "error" not in page_content:
-                    all_pages.append(page_content)
-                    seen_titles.add(title)
-                    pages_collected += 1
-                    print(f"  ✓ Collected ({pages_collected}/{max_pages})")
-                else:
-                    print(f"  ✗ Failed: {page_content.get('error')}")
-                
-                await asyncio.sleep(0.3)
+                return await crawler.get_page_content(title)
+
+        tasks = [asyncio.create_task(fetch_one(title)) for title in candidate_titles[:max_pages]]
+
+        for task in asyncio.as_completed(tasks):
+            page_content = await task
+            if "error" not in page_content:
+                all_pages.append(page_content)
+                print(f"  ✓ Collected ({len(all_pages)}/{max_pages})")
+            else:
+                print(f"  ✗ Failed: {page_content.get('error')}")
+
+            if len(all_pages) >= max_pages:
+                break
     
     return json.dumps({
         "total_crawled": len(all_pages),
-        "unique_pages": len(seen_titles),
+        "unique_pages": len(all_pages),
         "pages": all_pages
     }, ensure_ascii=False, indent=2)
 
@@ -235,6 +296,26 @@ def save_page_to_category(
     ),
     file_format: str = Field(description="File format: 'md' or 'txt'", default="md")
     ) -> str:
+    return _save_page_to_category_impl(
+        domain=domain,
+        category=category,
+        title=title,
+        content=content,
+        url=url,
+        metadata=metadata,
+        file_format=file_format,
+    )
+
+
+def _save_page_to_category_impl(
+    domain: str,
+    category: str,
+    title: str,
+    content: str,
+    url: str,
+    metadata: Dict[str, Any],
+    file_format: str,
+) -> str:
     """
     将页面内容保存到分类文件夹
     
@@ -308,9 +389,29 @@ def generate_markdown_index(
     categories: List[Dict[str, Any]] = Field(description="List of categories with pages"),
     total_pages: int = Field(description="Total number of pages"),
     index_summary: str = Field(description="Overall summary of the index"),
-    uncategorized: List[Dict[str, Any]] = Field(description="Uncategorized pages", default=[]),
-    category_relations: List[Dict[str, str]] = Field(description="Relations between categories", default=[]),
+    uncategorized: List[Dict[str, Any]] = Field(description="Uncategorized pages", default_factory=list),
+    category_relations: List[Dict[str, str]] = Field(description="Relations between categories", default_factory=list),
     language: str = Field(description="Language code: 'zh' or 'en'", default="zh")
+) -> str:
+    return _generate_markdown_index_impl(
+        domain=domain,
+        categories=categories,
+        total_pages=total_pages,
+        index_summary=index_summary,
+        uncategorized=uncategorized,
+        category_relations=category_relations,
+        language=language,
+    )
+
+
+def _generate_markdown_index_impl(
+    domain: str,
+    categories: List[Dict[str, Any]],
+    total_pages: int,
+    index_summary: str,
+    uncategorized: List[Dict[str, Any]],
+    category_relations: List[Dict[str, str]],
+    language: str,
 ) -> str:
     """
     生成Markdown格式的索引文件
@@ -492,7 +593,7 @@ def save_categorized_content(
                 }
                 
                 # 保存到分类文件夹
-                result = save_page_to_category(
+                result = _save_page_to_category_impl(
                     domain=domain,
                     category=cat_name,
                     title=title,
@@ -504,7 +605,7 @@ def save_categorized_content(
                 results.append(result)
         
         # 2. 生成Markdown索引
-        index_result = generate_markdown_index(
+        index_result = _generate_markdown_index_impl(
             domain=domain,
             categories=categories,
             total_pages=categorized_data.get("total_pages", 0),

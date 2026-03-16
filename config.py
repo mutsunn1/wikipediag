@@ -28,6 +28,7 @@ class CrawlerConfig:
     # 爬取配置
     max_pages: int = 50
     pages_per_query: int = 5
+    https_proxy: Optional[str] = None  # 可选代理，例如 http://127.0.0.1:7890
     
     @property
     def content_dir(self) -> str:

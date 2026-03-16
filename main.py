@@ -55,7 +55,7 @@ def create_oxy_space(language: str = "zh"):
             model_name=os.getenv("DEFAULT_LLM_MODEL_NAME", "gpt-4o-mini"),
             llm_params={"temperature": 0.2, "max_tokens": 2048},
             semaphore=15,
-            timeout=120,
+            timeout=240,
         ),
         
         # ===== 工具注册 =====
@@ -201,6 +201,36 @@ def _extract_mas_text(result: Any) -> str:
     return str(result)
 
 
+def _is_timeout_response(text: str) -> bool:
+    """判断MAS返回文本是否为超时/取消类失败。"""
+    lower = (text or "").lower()
+    return (
+        "timed out" in lower
+        or "timeout" in lower
+        or "was cancelled" in lower
+        or "tool default_llm timed out" in lower
+    )
+
+
+async def _run_query_with_retry(mas: MAS, query: str, retries: int = 1) -> tuple[Any, float, bool]:
+    """执行MAS查询，遇到超时文本时进行有限重试。"""
+    start_time = datetime.now()
+    result: Any = ""
+    timed_out = False
+
+    for attempt in range(retries + 1):
+        result = await mas.chat_with_agent(payload={"query": query})
+        result_text = _extract_mas_text(result)
+        timed_out = _is_timeout_response(result_text)
+        if not timed_out:
+            break
+        if attempt < retries:
+            print(f"\n⚠️ 检测到LLM超时，正在重试 ({attempt + 1}/{retries})...")
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+    return result, elapsed, timed_out
+
+
 # ============================================
 # 主程序
 # ============================================
@@ -274,22 +304,26 @@ async def main(output_dir: str = "output", language: str = "zh"):
         try:
             async with MAS(oxy_space=oxy_space) as mas:
                 # 执行爬取任务
-                start_time = datetime.now()
-                result = await mas.chat_with_agent(payload={"query": query})
-                elapsed = (datetime.now() - start_time).total_seconds()
-                
+                result, elapsed, timed_out = await _run_query_with_retry(mas, query, retries=1)
+                summary_text = _extract_mas_text(result)
+
+                if timed_out:
+                    print(f"\n❌ 爬取失败: {domain}")
+                    print(f"   原因: LLM 调用超时（已重试）")
+                    print(f"   耗时: {elapsed:.1f}秒")
+                    summary = summary_text[:1000] if len(summary_text) > 1000 else summary_text
+                    print(f"\n📋 错误摘要:\n{summary}")
+                    continue
+
                 print(f"\n✅ 爬取完成: {domain}")
                 print(f"   耗时: {elapsed:.1f}秒")
                 print(f"\n📁 输出文件：")
                 print(f"   • 分类文件夹: {config.output_dir}/content/{domain.replace(' ', '_')}/")
                 print(f"   • Markdown索引: {config.output_dir}/index/{domain.replace(' ', '_')}_index.md")
                 print(f"   • JSON数据: {config.output_dir}/{domain.replace(' ', '_')}_data.json")
-                
-                # 打印结果摘要
-                summary_text = _extract_mas_text(result)
-                if summary_text:
-                    summary = summary_text[:1000] if len(summary_text) > 1000 else summary_text
-                    print(f"\n📋 结果摘要:\n{summary}")
+
+                summary = summary_text[:1000] if len(summary_text) > 1000 else summary_text
+                print(f"\n📋 结果摘要:\n{summary}")
                 
         except Exception as e:
             print(f"\n❌ 爬取失败: {domain}")
@@ -329,7 +363,7 @@ async def quick_demo(output_dir: str = "output"):
             model_name=os.getenv("DEFAULT_LLM_MODEL_NAME", "gpt-4o-mini"),
             llm_params={"temperature": 0.2, "max_tokens": 2048},
             semaphore=10,
-            timeout=120,
+            timeout=240,
         ),
         tools.wikipedia_tools,
         tools.file_tools,
@@ -381,19 +415,22 @@ Output should be in Chinese (简体中文)."""
         print("-" * 70)
         
         try:
-            start_time = datetime.now()
-            result = await mas.chat_with_agent(payload={"query": query})
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
+            result, elapsed, timed_out = await _run_query_with_retry(mas, query, retries=1)
+            result_text = _extract_mas_text(result)
+
+            if timed_out:
+                print(f"\n❌ 爬取失败！耗时: {elapsed:.1f}秒")
+                print("   原因: LLM 调用超时（已重试）")
+                print(f"\n📋 错误摘要:\n{result_text[:800]}")
+                return
+
             print(f"\n✅ 爬取完成！耗时: {elapsed:.1f}秒")
             print(f"\n📁 输出文件：")
             print(f"   • 分类文件夹: {config.output_dir}/content/Computer Science/")
             print(f"   • Markdown索引: {config.output_dir}/index/Computer Science_index.md")
             print(f"   • JSON数据: {config.output_dir}/Computer Science_data.json")
-            
-            result_text = _extract_mas_text(result)
-            if result_text:
-                print(f"\n📋 结果:\n{result_text}")
+
+            print(f"\n📋 结果:\n{result_text}")
         except Exception as e:
             print(f"\n❌ 错误: {str(e)}")
             import traceback
@@ -444,18 +481,21 @@ async def custom_crawl(
     
     try:
         async with MAS(oxy_space=oxy_space) as mas:
-            start_time = datetime.now()
-            result = await mas.chat_with_agent(payload={"query": query})
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
+            result, elapsed, timed_out = await _run_query_with_retry(mas, query, retries=1)
+            result_text = _extract_mas_text(result)
+
+            if timed_out:
+                print(f"\n❌ 爬取失败！耗时: {elapsed:.1f}秒")
+                print("   原因: LLM 调用超时（已重试）")
+                print(f"\n📋 错误摘要:\n{result_text[:800]}")
+                return
+
             print(f"\n✅ 爬取完成！耗时: {elapsed:.1f}秒")
             print(f"\n📁 输出文件：")
             print(f"   • 分类文件夹: {config.output_dir}/content/{domain.replace(' ', '_')}/")
             print(f"   • Markdown索引: {config.output_dir}/index/{domain.replace(' ', '_')}_index.md")
-            
-            result_text = _extract_mas_text(result)
-            if result_text:
-                print(f"\n📋 结果摘要:\n{result_text[:800]}")
+
+            print(f"\n📋 结果摘要:\n{result_text[:800]}")
                 
     except Exception as e:
         print(f"\n❌ 错误: {str(e)}")
